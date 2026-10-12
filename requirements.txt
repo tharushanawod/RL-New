@@ -1,0 +1,6 @@
+numpy>=1.24
+# optional
+matplotlib>=3.7   # learning-curve plots
+scipy>=1.10       # Hungarian route matching (greedy fallback without it)
+pandas>=2.0       # load_q_table_dataframe convenience
+psutil>=5.9       # memory reporting

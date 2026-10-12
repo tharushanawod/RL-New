@@ -1,0 +1,4 @@
+transit_rl/results/*
+!transit_rl/results/.gitkeep
+__pycache__/
+*.pyc

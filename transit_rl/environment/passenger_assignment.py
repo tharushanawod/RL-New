@@ -13,22 +13,26 @@ Algorithm for every ordered OD pair (i, j) with demand d > 0:
        set: combined frequency F = sum f_k, wait = factor * 60 / F, demand
        split in proportion f_k / F.
     2. one-transfer paths: route k1 from i to transfer stop s, route k2 from s
-       to j.  Best (minimum generalised time) path receives all demand.
+       to j. Choose the best path with space on every leg.
     3. two-transfer paths (optional): k1: i->s1, k2: s1->s2, k3: s2->j.
     4. generalised time = IVT + waiting time(s) + transfer penalty per transfer.
     5. path category chosen by PATH_CHOICE_RULE (see config).
-    6. if no acceptable path exists, d is unserved.
+    6. board only up to the residual capacity of every traversed segment.
+       Retry leftover demand on other feasible paths; otherwise it is unserved.
 
-ASSUMPTIONS (see config.py): uncapacitated assignment, wait = 0.5 * headway,
-fixed transfer penalty, all-or-nothing choice for transfer paths.  Capacity
-(BUS_CAPACITY) is evaluated after assignment as "overload passengers".
+Hourly capacity per segment and direction is frequency * BUS_CAPACITY *
+BUS_LOAD_FACTOR (50 passengers per departure with 40 seats and factor 1.25).
+Seats are reusable after alighting. OD pairs are processed in deterministic
+origin/destination order; this is a greedy feasible assignment, not a global
+maximum-throughput optimisation. Fractional flows and expected waits are hourly
+averages; no individual departure timetable is simulated.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -182,17 +186,122 @@ class PassengerAssignment:
             self._route_tables[route] = t
         return t
 
+    def _choose_path(self, i: int, j: int, routes: List[_RouteIndex],
+                     routes_at: Dict[int, List[int]], common: list,
+                     available: Callable[[int, int, int], float]):
+        """Choose a path with residual capacity on every leg.
+
+        Recomputed after a bottleneck fills so leftover demand can use other
+        direct lines or transfer paths. Ties follow route/stop order.
+        """
+        cfg, R = self.cfg, len(routes)
+        penalty = cfg.transfer_penalty_minutes
+        times = {}
+
+        def travel_time(k: int, a: int, b: int) -> Optional[float]:
+            key = (k, a, b)
+            if key not in times:
+                t = routes[k].ivt.get((a, b))
+                times[key] = t if t is not None and available(k, a, b) > 1e-9 else None
+            return times[key]
+
+        def acceptable(gen: float) -> bool:
+            return cfg.max_acceptable_trip_minutes is None or gen <= cfg.max_acceptable_trip_minutes
+
+        options = []  # (generalised time, n_transfers, ivt, wait, legs_with_shares)
+
+        # ---- 1. direct ------------------------------------------------
+        cands = []
+        for k in routes_at[i]:
+            t = travel_time(k, i, j)
+            if t is not None:
+                cands.append((k, t))
+        if cands:
+            best = min(t for _, t in cands)
+            group = [(k, t) for k, t in cands if t <= best + cfg.direct_path_tolerance_minutes]
+            F = sum(routes[k].frequency for k, _ in group)
+            wait = cfg.waiting_time_factor * 60.0 / F
+            ivt = sum(routes[k].frequency * t for k, t in group) / F
+            legs = [((k, i, j), routes[k].frequency / F) for k, _ in group]
+            if acceptable(ivt + wait):
+                options.append((ivt + wait, 0, ivt, wait, legs))
+
+        need_more = cfg.path_choice_rule == "min_generalised_time" or not options
+        # ---- 2. one transfer -------------------------------------------
+        if need_more:
+            best1 = None
+            for k1 in routes_at[i]:
+                r1 = routes[k1]
+                for k2 in routes_at[j]:
+                    if k1 == k2:
+                        continue
+                    r2 = routes[k2]
+                    for s in common[k1][k2]:
+                        if s == i or s == j:
+                            continue
+                        t1 = travel_time(k1, i, s)
+                        t2 = travel_time(k2, s, j)
+                        if t1 is None or t2 is None:
+                            continue
+                        gen = t1 + t2 + r1.wait + r2.wait + penalty
+                        if acceptable(gen) and (best1 is None or gen < best1[0]):
+                            best1 = (gen, 1, t1 + t2, r1.wait + r2.wait,
+                                     [((k1, i, s), 1.0), ((k2, s, j), 1.0)])
+            if best1 is not None:
+                options.append(best1)
+            need_more = cfg.path_choice_rule == "min_generalised_time" or not options
+
+        # ---- 3. two transfers -----------------------------------------
+        if need_more and cfg.enable_two_transfer_paths:
+            best2 = None
+            for k1 in routes_at[i]:
+                r1 = routes[k1]
+                for k3 in routes_at[j]:
+                    if k3 == k1:
+                        continue
+                    r3 = routes[k3]
+                    for k2 in range(R):
+                        if k2 == k1 or k2 == k3:
+                            continue
+                        r2 = routes[k2]
+                        for s1 in common[k1][k2]:
+                            if s1 == i or s1 == j:
+                                continue
+                            t1 = travel_time(k1, i, s1)
+                            if t1 is None:
+                                continue
+                            for s2 in common[k2][k3]:
+                                if s2 == j or s2 == s1 or s2 == i:
+                                    continue
+                                t2 = travel_time(k2, s1, s2)
+                                t3 = travel_time(k3, s2, j)
+                                if t2 is None or t3 is None:
+                                    continue
+                                w = r1.wait + r2.wait + r3.wait
+                                gen = t1 + t2 + t3 + w + 2 * penalty
+                                if acceptable(gen) and (best2 is None or gen < best2[0]):
+                                    best2 = (gen, 2, t1 + t2 + t3, w,
+                                             [((k1, i, s1), 1.0), ((k2, s1, s2), 1.0), ((k3, s2, j), 1.0)])
+            if best2 is not None:
+                options.append(best2)
+
+        # ---- choose ----------------------------------------------------
+        chosen = None
+        if options:
+            chosen = options[0] if cfg.path_choice_rule == "min_transfers_first" else min(options, key=lambda o: o[0])
+        return chosen
+
     def _assign_uncached(self, hour: int, plan: ServicePlan) -> AssignmentResult:
         cfg, n = self.cfg, self.network.num_stops
-        od = self.od_matrices[hour - 1]
         routes = [_RouteIndex(rs.route, rs.frequency, self._table(rs.route), cfg.waiting_time_factor)
                   for rs in plan]
         R = len(routes)
+        capacities = [r.frequency * cfg.bus_capacity * cfg.bus_load_factor for r in routes]
         routes_at: Dict[int, List[int]] = {s: [] for s in self.network.stops}
         for k, r in enumerate(routes):
             for s in r.pos:
                 routes_at[s].append(k)
-        common = [[(set(routes[a].pos) & set(routes[b].pos)) if a != b else set() for b in range(R)]
+        common = [[tuple(sorted(set(routes[a].pos) & set(routes[b].pos))) if a != b else () for b in range(R)]
                   for a in range(R)]
         penalty = cfg.transfer_penalty_minutes
 
@@ -203,125 +312,52 @@ class PassengerAssignment:
         fwd_load = [np.zeros(max(len(r.stops) - 1, 0)) for r in routes]
         bwd_load = [np.zeros(max(len(r.stops) - 1, 0)) for r in routes]
 
+        def leg_load(k: int, a: int, b: int) -> np.ndarray:
+            pa, pb = routes[k].pos[a], routes[k].pos[b]
+            return fwd_load[k][pa:pb] if pa < pb else bwd_load[k][pb:pa]
+
+        def available(k: int, a: int, b: int) -> float:
+            return max(0.0, capacities[k] - float(leg_load(k, a, b).max()))
+
         tot_ivt = tot_wait = tot_pen = 0.0
         n_direct = n_one = n_two = n_unserved = 0.0
         total_demand = 0.0
 
         for i, j, d in self._pairs[hour - 1]:
             total_demand += d
-            options = []  # (generalised time, n_transfers, ivt, wait, legs_with_shares)
-
-            # ---- 1. direct ------------------------------------------------
-            cands = []
-            for k in routes_at[i]:
-                t = routes[k].ivt.get((i, j))
-                if t is not None:
-                    cands.append((k, t))
-            if cands:
-                best = min(t for _, t in cands)
-                group = [(k, t) for k, t in cands if t <= best + cfg.direct_path_tolerance_minutes]
-                F = sum(routes[k].frequency for k, _ in group)
-                wait = cfg.waiting_time_factor * 60.0 / F
-                ivt = sum(routes[k].frequency * t for k, t in group) / F
-                legs = [((k, i, j), routes[k].frequency / F) for k, _ in group]
-                options.append((ivt + wait, 0, ivt, wait, legs))
-
-            need_more = cfg.path_choice_rule == "min_generalised_time" or not options
-            # ---- 2. one transfer -------------------------------------------
-            if need_more:
-                best1 = None
-                for k1 in routes_at[i]:
-                    r1 = routes[k1]
-                    for k2 in routes_at[j]:
-                        if k1 == k2:
-                            continue
-                        r2 = routes[k2]
-                        for s in common[k1][k2]:
-                            if s == i or s == j:
-                                continue
-                            t1 = r1.ivt.get((i, s))
-                            t2 = r2.ivt.get((s, j))
-                            if t1 is None or t2 is None:
-                                continue
-                            gen = t1 + t2 + r1.wait + r2.wait + penalty
-                            if best1 is None or gen < best1[0]:
-                                best1 = (gen, 1, t1 + t2, r1.wait + r2.wait,
-                                         [((k1, i, s), 1.0), ((k2, s, j), 1.0)])
-                if best1 is not None:
-                    options.append(best1)
-                need_more = cfg.path_choice_rule == "min_generalised_time" or not options
-
-            # ---- 3. two transfers -----------------------------------------
-            if need_more and cfg.enable_two_transfer_paths:
-                best2 = None
-                for k1 in routes_at[i]:
-                    r1 = routes[k1]
-                    for k3 in routes_at[j]:
-                        if k3 == k1:
-                            continue
-                        r3 = routes[k3]
-                        for k2 in range(R):
-                            if k2 == k1 or k2 == k3:
-                                continue
-                            r2 = routes[k2]
-                            for s1 in common[k1][k2]:
-                                if s1 == i or s1 == j:
-                                    continue
-                                t1 = r1.ivt.get((i, s1))
-                                if t1 is None:
-                                    continue
-                                for s2 in common[k2][k3]:
-                                    if s2 == j or s2 == s1 or s2 == i:
-                                        continue
-                                    t2 = r2.ivt.get((s1, s2))
-                                    t3 = r3.ivt.get((s2, j))
-                                    if t2 is None or t3 is None:
-                                        continue
-                                    w = r1.wait + r2.wait + r3.wait
-                                    gen = t1 + t2 + t3 + w + 2 * penalty
-                                    if best2 is None or gen < best2[0]:
-                                        best2 = (gen, 2, t1 + t2 + t3, w,
-                                                 [((k1, i, s1), 1.0), ((k2, s1, s2), 1.0), ((k3, s2, j), 1.0)])
-                if best2 is not None:
-                    options.append(best2)
-
-            # ---- choose ----------------------------------------------------
-            chosen = None
-            if options:
-                chosen = options[0] if cfg.path_choice_rule == "min_transfers_first" else min(options, key=lambda o: o[0])
-                if cfg.max_acceptable_trip_minutes is not None and chosen[0] > cfg.max_acceptable_trip_minutes:
-                    chosen = None
-            if chosen is None:
-                n_unserved += d
-                unserved[i - 1, j - 1] += d
-                continue
-
-            _, n_tr, ivt, wait, legs = chosen
-            tot_ivt += d * ivt
-            tot_wait += d * wait
-            tot_pen += d * n_tr * penalty
-            assigned[i - 1, j - 1] += d
-            if n_tr == 0:
-                n_direct += d
-                direct_m[i - 1, j - 1] += d
-            else:
-                transfer_m[i - 1, j - 1] += d
-                if n_tr == 1:
-                    n_one += d
+            remaining = d
+            while remaining > 0:
+                chosen = self._choose_path(i, j, routes, routes_at, common, available)
+                if chosen is None:
+                    break
+                legs = chosen[4]
+                amount = min(remaining, min(available(k, a, b) / share
+                                           for (k, a, b), share in legs))
+                _, n_tr, ivt, wait, legs = chosen
+                tot_ivt += amount * ivt
+                tot_wait += amount * wait
+                tot_pen += amount * n_tr * penalty
+                assigned[i - 1, j - 1] += amount
+                if n_tr == 0:
+                    n_direct += amount
+                    direct_m[i - 1, j - 1] += amount
                 else:
-                    n_two += d
-            for (k, a, b), share in legs:
-                pa, pb = routes[k].pos[a], routes[k].pos[b]
-                if pa < pb:
-                    fwd_load[k][pa:pb] += d * share
-                else:
-                    bwd_load[k][pb:pa] += d * share
+                    transfer_m[i - 1, j - 1] += amount
+                    if n_tr == 1:
+                        n_one += amount
+                    else:
+                        n_two += amount
+                for (k, a, b), share in legs:
+                    leg_load(k, a, b)[:] += amount * share
+                remaining = max(0.0, remaining - amount)
+            n_unserved += remaining
+            unserved[i - 1, j - 1] = remaining
 
-        # ---- capacity check (passengers above hourly route capacity) --------
+        # ---- actual boarded loads (overload should be zero within rounding) -
         overload = 0.0
         peaks = []
         for k, r in enumerate(routes):
-            capacity = r.frequency * cfg.bus_capacity
+            capacity = capacities[k]
             pf = float(fwd_load[k].max()) if fwd_load[k].size else 0.0
             pb = float(bwd_load[k].max()) if bwd_load[k].size else 0.0
             overload += max(0.0, pf - capacity) + max(0.0, pb - capacity)

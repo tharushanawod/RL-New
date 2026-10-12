@@ -88,6 +88,8 @@ def main() -> None:
         assert [r["clock_hour"] for r in trained_records] == cfg.od_file_numbers()
         for r in trained_records:
             assert r["total_fleet_used"] <= cfg.max_fleet
+            assert math.isclose(r["served_passengers"] + r["unserved_passengers"], r["total_demand"])
+            assert math.isclose(r["overload_passengers"], 0, abs_tol=1e-9)
             assert math.isclose(r["operator_component"], r["total_fleet_used"] / cfg.max_fleet)
             expected_s = r["served_passengers"] / r["total_demand"] if r["total_demand"] > 0 else 0
             assert math.isclose(r["service_component"], expected_s)

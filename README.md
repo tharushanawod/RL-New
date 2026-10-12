@@ -122,11 +122,23 @@ weighted fleet and route-time costs, and weighted route/frequency transitions.
 
 The raw six-field state, eight action types and their masks, Q-learning backup,
 epsilon schedule, 24-hour OD ordering, immutable OD matrices and plans,
-assignment path enumeration/common-lines splitting/cache, fleet rounding and
-frequency fallback are preserved. Capacity retains its existing interpretation:
-assignment is uncapacitated and reports peak overload relative to
-`BUS_CAPACITY * frequency`; it does not enforce a hard boarding limit. Overload
-is now diagnostic only, as required by removing its reward penalty.
+assignment cache, fleet rounding and frequency fallback are preserved.
+Assignment now enforces capacity on each route segment in each direction:
+`frequency * BUS_CAPACITY * BUS_LOAD_FACTOR` passengers per hour. The defaults
+are 40 seats and a 1.25 load factor, giving a maximum of 50 passengers per bus
+departure. Capacity is reused after alighting, and a transfer trip is served
+only when every leg has space. Remaining demand tries other direct/transfer
+paths under the configured path-choice rule and trip-time limit, then becomes
+`unserved_demand`/`unserved_passengers` if no feasible path remains. Only boarded
+passengers contribute to served counts, travel times and service rewards.
+`overload_passengers` describes actual boarded overload and should be zero
+within floating-point rounding; it is not an alternative measure of unmet demand.
+
+OD pairs are assigned in origin/destination order. This greedy assignment
+enforces capacity but does not optimise total network throughput or guarantee
+fair allocation between OD pairs. Flows and waits are hourly averages, not a
+simulation of individual departures. Existing results and Q-tables were generated
+under the old assignment; rerun training to obtain results with enforced capacity.
 
 Hourly CSV/JSON expose `served_passengers`, `served_demand_ratio`, raw
 `service_component=S_t`, raw `operator_component=O_t`, weighted

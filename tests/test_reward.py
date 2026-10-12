@@ -29,7 +29,7 @@ class RewardTests(unittest.TestCase):
     def make_env(self, **overrides):
         cfg = dataclasses.replace(
             ExperimentConfig(), num_stops=3, num_hours=2, od_start_file_hour=0,
-            max_fleet=100, bus_capacity=20, initial_route_frequency=2,
+            max_fleet=100, bus_capacity=40, initial_route_frequency=2,
             max_route_length=3, make_plots=False, **overrides)
         cfg.validate()
         network = build_network([(1, 2, 5), (2, 3, 7)], 3, True)
@@ -58,15 +58,19 @@ class RewardTests(unittest.TestCase):
         self.assertEqual(reward, env.reward_calc.compute(
             assignment, 10, dataclasses.replace(transition, total=0.9, frequency_change=0.7)))
 
-    def test_existing_fleet_rounding_and_overload_accounting(self):
+    def test_fleet_rounding_and_capacity_feasible_service(self):
         env = self.make_env()
+        env = TransitEnvironment(env.network, env.od_matrices,
+                                 dataclasses.replace(env.cfg, bus_capacity=20))
         plan = (RouteService((1, 2), 2),)
         evaluation = env.evaluate_plan(plan)
-        # ceil(2 * (5 + 5) / 60) = 1; route capacity = 2 * 20 = 40.
+        # ceil(2 * (5 + 5) / 60) = 1; capacity = 2 * 20 * 1.25 = 50.
         self.assertEqual(evaluation.buses_per_route, [1])
-        self.assertEqual(evaluation.assignment.overload_passengers, 40)
+        self.assertEqual(evaluation.assignment.served_passengers, 50)
+        self.assertEqual(evaluation.assignment.unserved_passengers, 50)
+        self.assertEqual(evaluation.assignment.overload_passengers, 0)
         self.assertAlmostEqual(evaluation.reward["operator_component"], 0.01)
-        self.assertAlmostEqual(evaluation.reward["total_reward"], 0.8 - 0.3 * 0.01)
+        self.assertAlmostEqual(evaluation.reward["total_reward"], 0.5 - 0.3 * 0.01)
 
     def test_fleet_masking_and_bus_release_are_preserved(self):
         env = self.make_env()
@@ -148,7 +152,11 @@ class RewardTests(unittest.TestCase):
                                0.8 - 0.3 * 0.01)
         before = env.evaluate_plan(previous)
         self.assertNotEqual(before.assignment.total_waiting_time, result.assignment.total_waiting_time)
-        self.assertEqual(before.reward["total_reward"], result.reward["total_reward"])
+        # At hour 2 the lower frequency can board only 100 of 200 passengers;
+        # increasing frequency makes all 160 reachable passengers feasible.
+        self.assertEqual(before.assignment.served_passengers, 100)
+        self.assertEqual(result.assignment.served_passengers, 160)
+        self.assertAlmostEqual(before.reward["total_reward"], 0.5 - 0.3 * 0.01)
 
     def test_hungarian_reversal_and_edit_distance_are_preserved(self):
         if transition_cost._hungarian is None:
@@ -200,8 +208,8 @@ class RewardTests(unittest.TestCase):
             env.step(Action("FINISH_PLAN"))
         records = env.hourly_records
         day = summarise_day(records)
-        self.assertAlmostEqual(day["served_demand_ratio"], 0.8)
-        self.assertAlmostEqual(day["total_service_component"], 0.8 + 0.8)
+        self.assertAlmostEqual(day["served_demand_ratio"], 180 / 300)
+        self.assertAlmostEqual(day["total_service_component"], 0.8 + 0.5)
         self.assertAlmostEqual(day["daily_plan_reward"], day["total_service_component"]
                                - day["total_operator_penalty"] - day["total_transition_component"])
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,6 +217,9 @@ class RewardTests(unittest.TestCase):
             with (Path(tmp) / "hourly_service_plans.csv").open(newline="", encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
             for row in rows:
+                self.assertAlmostEqual(float(row["served_passengers"]) + float(row["unserved_passengers"]),
+                                       float(row["total_demand"]))
+                self.assertAlmostEqual(float(row["overload_passengers"]), 0)
                 self.assertAlmostEqual(float(row["service_component"]),
                                        float(row["served_passengers"]) / float(row["total_demand"]))
                 self.assertAlmostEqual(float(row["total_reward"]), float(row["service_component"])

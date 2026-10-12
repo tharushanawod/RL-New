@@ -77,7 +77,8 @@ LINKS_ARE_BIDIRECTIONAL = True
 # 3. FLEET AND FREQUENCY
 # =============================================================================
 MAX_FLEET = 99
-BUS_CAPACITY = 40
+BUS_CAPACITY = 40            # seats per bus
+BUS_LOAD_FACTOR = 1.25       # maximum passengers / seats: 40 * 1.25 = 50 per bus
 
 MIN_FREQUENCY = 1.0          # ASSUMPTION: buses/hour
 MAX_FREQUENCY = 12.0         # ASSUMPTION: buses/hour (5-minute headway)
@@ -147,8 +148,9 @@ DIRECT_PATH_TOLERANCE_MINUTES = 2.0
 MAX_ACCEPTABLE_TRIP_MINUTES: Optional[float] = None
 # ASSUMPTION: OD diagonal (i -> i) is not a bus trip and is ignored.
 IGNORE_OD_DIAGONAL = True
-# ASSUMPTION: assignment is uncapacitated; BUS_CAPACITY is used to report the
-# number of passengers exceeding route capacity (diagnostic only, no reward penalty).
+# Hourly capacity per route segment and direction is frequency * BUS_CAPACITY
+# * BUS_LOAD_FACTOR. Boarding requires space on every leg; unmet demand is
+# unserved. Seats can be reused after passengers alight.
 # In terminal/delta modes, assignment during route construction is optional.
 # Dense mode always evaluates feasible tentative routes for immediate feedback.
 ASSIGN_AFTER_ROUTE_CONSTRUCTION_STEPS = False
@@ -244,6 +246,7 @@ class ExperimentConfig:
     # fleet / frequency
     max_fleet: int = MAX_FLEET
     bus_capacity: int = BUS_CAPACITY
+    bus_load_factor: float = BUS_LOAD_FACTOR
     min_frequency: float = MIN_FREQUENCY
     max_frequency: float = MAX_FREQUENCY
     frequency_step: float = FREQUENCY_STEP
@@ -336,6 +339,8 @@ class ExperimentConfig:
             (2 <= self.min_route_length <= self.max_route_length, "need 2 <= MIN_ROUTE_LENGTH <= MAX_ROUTE_LENGTH"),
             (self.max_routes >= 1, "max_routes >= 1"),
             (self.max_fleet >= 1 and self.bus_capacity >= 1, "fleet and capacity must be >= 1"),
+            (math.isfinite(self.bus_load_factor) and self.bus_load_factor > 0,
+             "bus_load_factor must be finite and > 0"),
             (self.current_plan_start_mode in ("copy_previous", "empty"), "bad CURRENT_PLAN_START_MODE"),
             (self.path_choice_rule in ("min_transfers_first", "min_generalised_time"), "bad PATH_CHOICE_RULE"),
             (self.route_matching_method in ("hungarian", "greedy"), "bad ROUTE_MATCHING_METHOD"),
